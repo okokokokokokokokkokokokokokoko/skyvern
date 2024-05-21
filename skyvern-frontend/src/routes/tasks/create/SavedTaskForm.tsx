@@ -1,6 +1,4 @@
-import { z } from "zod";
-import { zodResolver } from "@hookform/resolvers/zod";
-import { useForm } from "react-hook-form";
+import { getClient } from "@/api/AxiosClient";
 import { Button } from "@/components/ui/button";
 import {
   Form,
@@ -11,6 +9,26 @@ import {
   FormMessage,
 } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { useToast } from "@/components/ui/use-toast";
+import { useApiCredential } from "@/hooks/useApiCredential";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { apiBaseUrl } from "@/util/env";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { InfoCircledIcon, ReloadIcon } from "@radix-ui/react-icons";
+import { ToastAction } from "@radix-ui/react-toast";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import fetchToCurl from "fetch-to-curl";
+import { useForm, useFormState } from "react-hook-form";
+import { Link, useParams } from "react-router-dom";
+import { stringify as convertToYAML } from "yaml";
+import { z } from "zod";
 import {
   dataExtractionGoalDescription,
   extractedInformationSchemaDescription,
@@ -19,29 +37,16 @@ import {
   urlDescription,
   webhookCallbackUrlDescription,
 } from "../data/descriptionHelperContent";
-import { Textarea } from "@/components/ui/textarea";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { getClient } from "@/api/AxiosClient";
-import { useToast } from "@/components/ui/use-toast";
-import { InfoCircledIcon, ReloadIcon } from "@radix-ui/react-icons";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
-import { ToastAction } from "@radix-ui/react-toast";
-import { Link } from "react-router-dom";
-import fetchToCurl from "fetch-to-curl";
-import { apiBaseUrl } from "@/util/env";
-import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useApiCredential } from "@/hooks/useApiCredential";
+import { SubmitEvent } from "@/types";
 
-const createNewTaskFormSchema = z
+const savedTaskFormSchema = z
   .object({
+    title: z.string().min(1, "Title is required"),
+    description: z.string(),
     url: z.string().url({
       message: "Invalid URL",
     }),
+    proxyLocation: z.string().or(z.null()).optional(),
     webhookCallbackUrl: z.string().or(z.null()).optional(), // url maybe, but shouldn't be validated as one
     navigationGoal: z.string().or(z.null()).optional(),
     dataExtractionGoal: z.string().or(z.null()).optional(),
@@ -66,23 +71,23 @@ const createNewTaskFormSchema = z
     }
   });
 
-export type CreateNewTaskFormValues = z.infer<typeof createNewTaskFormSchema>;
+export type SavedTaskFormValues = z.infer<typeof savedTaskFormSchema>;
 
 type Props = {
-  initialValues: CreateNewTaskFormValues;
+  initialValues: SavedTaskFormValues;
 };
 
 function transform(value: unknown) {
   return value === "" ? null : value;
 }
 
-function createTaskRequestObject(formValues: CreateNewTaskFormValues) {
+function createTaskRequestObject(formValues: SavedTaskFormValues) {
   return {
     url: formValues.url,
     webhook_callback_url: transform(formValues.webhookCallbackUrl),
     navigation_goal: transform(formValues.navigationGoal),
     data_extraction_goal: transform(formValues.dataExtractionGoal),
-    proxy_location: "NONE",
+    proxy_location: transform(formValues.proxyLocation),
     error_code_mapping: null,
     navigation_payload: transform(formValues.navigationPayload),
     extracted_information_schema: transform(
@@ -91,19 +96,51 @@ function createTaskRequestObject(formValues: CreateNewTaskFormValues) {
   };
 }
 
-function CreateNewTaskForm({ initialValues }: Props) {
+function createTaskTemplateRequestObject(values: SavedTaskFormValues) {
+  return {
+    title: values.title,
+    description: values.description,
+    webhook_callback_url: values.webhookCallbackUrl,
+    proxy_location: values.proxyLocation,
+    workflow_definition: {
+      parameters: [
+        {
+          parameter_type: "workflow",
+          workflow_parameter_type: "json",
+          key: "navigation_payload",
+          default_value: JSON.stringify(values.navigationPayload),
+        },
+      ],
+      blocks: [
+        {
+          block_type: "task",
+          label: "Task 1",
+          url: values.url,
+          navigation_goal: values.navigationGoal,
+          data_extraction_goal: values.dataExtractionGoal,
+          data_schema: values.extractedInformationSchema,
+        },
+      ],
+    },
+  };
+}
+
+function SavedTaskForm({ initialValues }: Props) {
   const queryClient = useQueryClient();
   const { toast } = useToast();
   const credentialGetter = useCredentialGetter();
   const apiCredential = useApiCredential();
+  const { template } = useParams();
 
-  const form = useForm<CreateNewTaskFormValues>({
-    resolver: zodResolver(createNewTaskFormSchema),
+  const form = useForm<SavedTaskFormValues>({
+    resolver: zodResolver(savedTaskFormSchema),
     defaultValues: initialValues,
   });
 
-  const mutation = useMutation({
-    mutationFn: async (formValues: CreateNewTaskFormValues) => {
+  const { isDirty } = useFormState({ control: form.control });
+
+  const createTaskMutation = useMutation({
+    mutationFn: async (formValues: SavedTaskFormValues) => {
       const taskRequest = createTaskRequestObject(formValues);
       const client = await getClient(credentialGetter);
       return client.post<
@@ -114,7 +151,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
     onError: (error) => {
       toast({
         variant: "destructive",
-        title: "There was an error creating the task.",
+        title: "Error",
         description: error.message,
       });
     },
@@ -136,13 +173,87 @@ function CreateNewTaskForm({ initialValues }: Props) {
     },
   });
 
-  function onSubmit(values: CreateNewTaskFormValues) {
-    mutation.mutate(values);
+  const saveTaskMutation = useMutation({
+    mutationFn: async (formValues: SavedTaskFormValues) => {
+      const saveTaskRequest = createTaskTemplateRequestObject(formValues);
+      const client = await getClient(credentialGetter);
+      const yaml = convertToYAML(saveTaskRequest);
+      return client
+        .put(`/workflows/${template}`, yaml, {
+          headers: {
+            "Content-Type": "text/plain",
+          },
+        })
+        .then((response) => response.data);
+    },
+    onError: (error) => {
+      toast({
+        variant: "destructive",
+        title: "There was an error while saving changes",
+        description: error.message,
+      });
+    },
+    onSuccess: () => {
+      toast({
+        title: "Changes saved",
+        description: "Changes saved successfully",
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["workflows", template],
+      });
+    },
+  });
+
+  function handleCreate(values: SavedTaskFormValues) {
+    createTaskMutation.mutate(values);
+  }
+
+  function handleSave(values: SavedTaskFormValues) {
+    saveTaskMutation.mutate(values);
   }
 
   return (
     <Form {...form}>
-      <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-8">
+      <form
+        onSubmit={(event) => {
+          const submitter = (
+            (event.nativeEvent as SubmitEvent).submitter as HTMLButtonElement
+          ).value;
+          if (submitter === "save") {
+            form.handleSubmit(handleSave)(event);
+          }
+          if (submitter === "create") {
+            form.handleSubmit(handleCreate)(event);
+          }
+        }}
+        className="space-y-8"
+      >
+        <FormField
+          control={form.control}
+          name="title"
+          render={({ field }) => (
+            <FormItem>
+              <FormLabel>Title *</FormLabel>
+              <FormControl>
+                <Input placeholder="Title" {...field} />
+              </FormControl>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+        <FormField
+          control={form.control}
+          name="description"
+          render={({ field }) => (
+            <FormItem>
+              <FormLabel>Description</FormLabel>
+              <FormControl>
+                <Textarea placeholder="Description" {...field} />
+              </FormControl>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
         <FormField
           control={form.control}
           name="url"
@@ -352,11 +463,31 @@ function CreateNewTaskForm({ initialValues }: Props) {
           >
             Copy cURL
           </Button>
-          <Button type="submit" disabled={mutation.isPending}>
-            {mutation.isPending && (
+          {isDirty && (
+            <Button
+              type="submit"
+              name="save"
+              value="save"
+              variant="secondary"
+              disabled={saveTaskMutation.isPending}
+            >
+              {saveTaskMutation.isPending && (
+                <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+              )}
+              Save Changes
+            </Button>
+          )}
+
+          <Button
+            type="submit"
+            name="create"
+            value="create"
+            disabled={createTaskMutation.isPending}
+          >
+            {createTaskMutation.isPending && (
               <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
             )}
-            Create
+            Run Task
           </Button>
         </div>
       </form>
@@ -364,4 +495,4 @@ function CreateNewTaskForm({ initialValues }: Props) {
   );
 }
 
-export { CreateNewTaskForm };
+export { SavedTaskForm };
